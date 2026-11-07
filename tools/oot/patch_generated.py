@@ -1,4 +1,4 @@
-"""Applies Ocarina's two source edits to the generated C of main. Run after recomp/gen.py.
+"""Applies Ocarina's source edits to the generated C of main. Run after recomp/gen.py.
 
 Lifted code holds no room for these through recomp/patches.py (one needs a branch, the other host code), and gen.py
 regenerates its output, so they live here. Each edit is checked: a generated file that does not match stops the build.
@@ -37,6 +37,9 @@ static void oot_dyn_dt(Cpu *c) {
 EDITS = [
     ('main_0087.c', 'void f_70006e6be0(Cpu *c) {\n', DYN_DT + 'void f_70006e6be0(Cpu *c) {\n'),
     ('main_0087.c', '    fp_op_s(c, FOP_DIV, 8, 1, 0);\n', '    fp_op_s(c, FOP_DIV, 8, 1, 0); oot_dyn_dt(c);   /* real time step, main+0x6e6dc4 */\n'),
+    ('main_0080.c', 'void f_700062ac50(Cpu *c) {\n    FN_ENTER(0x700062ac50ull);\n',
+     'extern void ov_camera_mouse(uint64_t node);\nvoid f_700062ac50(Cpu *c) {\n    FN_ENTER(0x700062ac50ull);\n'
+     '    ov_camera_mouse(c->x[0]);   /* the mouse turns the camera: main+0x62ac50 takes the camera node in x0 */\n'),
     ('main_0133.c', 'L_7000c93940:;\n', 'L_7000c93940:;\n    if (x19 == 0) { goto L_7000c93a18; }   /* an unloaded resource takes the not-found path; was a read of 0x150 */\n'),
 ]
 
