@@ -3683,7 +3683,7 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
 // Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
-    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
+    const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // explicit overrides keep their existing meaning
     if (!A.on || !cfg_bool("TOTK_LIB_PREBUILD")) return;
     GfxWarmEnt *all = NULL;
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
@@ -3704,7 +3704,11 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     lb_state(pr_hist, fs_hist);
     LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
-    int t = te && *te ? atoi(te) : cpus / 4;
+    // Speculative NVIDIA builds can slow foreground replay despite idle worker
+    // priority. Keep prebuild enabled, but serialize its default worker pool.
+    const VkCtx *ctx = vk_ctx();
+    int default_threads = ctx && ctx->props.vendorID == 0x10de ? 1 : cpus / 4;
+    int t = te && *te ? atoi(te) : default_threads;
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
     if ((size_t)t > n) t = (int)n;
     LB.t0 = now_ms();

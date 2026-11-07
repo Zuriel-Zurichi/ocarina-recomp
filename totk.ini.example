@@ -38,8 +38,8 @@
 # Which draws are dropped instead of waiting for their pipeline: strict (only draws into per-frame passes), any (also
 # draws into passes whose target the previous frame rendered) or fullscreen (those and full-screen draws).
 # pipe_skip = fullscreen
-# Build shader stage libraries in the background ahead of time, and the threads for it (1 to 16; default: a quarter of
-# the CPU threads).
+# Build shader stage libraries in the background ahead of time. Worker count (1 to 16): default 1 on NVIDIA,
+# otherwise a quarter of the CPU threads. More speculative workers can interfere with gameplay on NVIDIA.
 # lib_prebuild = 1
 # lib_prebuild_threads = 4
 # Build known pipelines ahead of time.
