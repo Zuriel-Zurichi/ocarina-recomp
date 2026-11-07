@@ -2856,7 +2856,9 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         static int skip_w = -1, skip_h;   // OOT_SKIP_PASS=<w>x<h>: no draws in passes of that size
         if (skip_w < 0) { const char *e = getenv("OOT_SKIP_PASS"); skip_w = 0; if (e) sscanf(e, "%dx%d", &skip_w, &skip_h); }
         if (skip_w && (int)ex->pass_w == skip_w && (int)ex->pass_h == skip_h) return 0;
-        if (ex->pass_w == 256 && ex->pass_h == 144 && getenv("OOT_COUNT_256")) {
+        static int count_small = -1;
+        if (count_small < 0) count_small = getenv("OOT_COUNT_256") != NULL;
+        if (ex->pass_w == 256 && ex->pass_h == 144 && count_small) {
             static int told;
             if (told++ < 200) rt_log("256-draw prog %llu count %d frame %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, (int)count, (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
         }
@@ -2944,7 +2946,9 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         mesh_task_draw = 1;
         B.c0_valid[0] = 0;
     }
-    if (ts && getenv("OOT_NO_TASK")) return 0;   // LOCAL TEST (Ocarina)
+    static int no_task = -1;
+    if (no_task < 0) no_task = getenv("OOT_NO_TASK") != NULL;
+    if (ts && no_task) return 0;
     if (vs && gfx_shader_is_mesh(vs)) mesh_task_draw = 1;
     if (!has_vs) return warn_once(W_NO_VS, "a draw with a program that has no vertex stage is skipped"), 0;
     if (vs && gfx_shader_is_mesh(vs) != draw_is_mesh) return draw_why(ex, "mesh program in a vertex draw, or the reverse"), 0;
@@ -2995,33 +2999,37 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     { uint64_t f_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED); if (f_ >= 1798 && f_ <= 1799 && ex->pass_w == 2560) rt_log("vk: draw into 2560 frame %llu program %llu viewport %g %g %g %g scissor %d %d %u %u", (unsigned long long)f_, (unsigned long long)ex->prog->serial, ex->vp[0][0], ex->vp[0][1], ex->vp[0][2], ex->vp[0][3], sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height); }
-    {   // LOCAL TEST (Ocarina): the value the material shaders divide by, per frame (fragment slot 2 + 0x8c)
+    {   // Material diagnostics only inspect resources while their output can be used.
         static uint64_t last;
+        static int flash_log = -1;
+        if (flash_log < 0) flash_log = getenv("OOT_FLASH_LOG") != NULL;
         uint64_t f_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        uint64_t a_ = ex->ssbo[NVN_STAGE_FS][2].addr;
-        VkMemInspect mi;
-        int mat_ = 0;
-        if (fs) {
-            const GfxShaderRes *r_;
-            int n_ = gfx_shader_resources(fs, GFX_RES_SSBO, &r_);
-            for (int i_ = 0; i_ < n_; i_++) mat_ |= r_[i_].cbuf_slot == 0 && r_[i_].handle * 4 == 0x530;
-        }
-        {   // per frame: the random rotation in fragment c6[38], for correlating with OOT_FLASH_LOG
-            static uint64_t lastf;
-            static char line[97];
-            static int nl_;
-            const p_bind_buf *u6 = &ex->ubo[NVN_STAGE_FS][3];
-            if (getenv("OOT_FLASH_LOG") && mat_ && f_ != lastf && u6->addr && u6->size >= 0x270) {
-                lastf = f_;
-                const float *q = (const float *)(uintptr_t)(u6->addr + 38 * 16);
-                line[nl_++] = q[1] < 0 ? '-' : '+';
-                if (nl_ == 96) { line[96] = 0; rt_log("rot: frame %llu: %s", (unsigned long long)f_, line); nl_ = 0; }
+        if (flash_log || (f_ >= 1700 && f_ < 1801)) {
+            uint64_t a_ = ex->ssbo[NVN_STAGE_FS][2].addr;
+            VkMemInspect mi;
+            int mat_ = 0;
+            if (fs) {
+                const GfxShaderRes *r_;
+                int n_ = gfx_shader_resources(fs, GFX_RES_SSBO, &r_);
+                for (int i_ = 0; i_ < n_; i_++) mat_ |= r_[i_].cbuf_slot == 0 && r_[i_].handle * 4 == 0x530;
             }
-        }
-        if (mat_ && f_ >= 1700 && f_ < 1801 && f_ != last && ex->pass_w == 1280 && a_ && vk_mem_inspect(a_ + 0x8c, 4, &mi) && mi.pool_kind == VK_MEM_INSPECT_POOL_IMPORT) {
-            last = f_;
-            const float *v_ = (const float *)(uintptr_t)(a_ + 0x80);
-            rt_log("vk: f %llu slot2 %#llx +0x80: %g %g %g %g", (unsigned long long)f_, (unsigned long long)a_, v_[0], v_[1], v_[2], v_[3]);
+            {   // per frame: the random rotation in fragment c6[38], for correlating with OOT_FLASH_LOG
+                static uint64_t lastf;
+                static char line[97];
+                static int nl_;
+                const p_bind_buf *u6 = &ex->ubo[NVN_STAGE_FS][3];
+                if (flash_log && mat_ && f_ != lastf && u6->addr && u6->size >= 0x270) {
+                    lastf = f_;
+                    const float *q = (const float *)(uintptr_t)(u6->addr + 38 * 16);
+                    line[nl_++] = q[1] < 0 ? '-' : '+';
+                    if (nl_ == 96) { line[96] = 0; rt_log("rot: frame %llu: %s", (unsigned long long)f_, line); nl_ = 0; }
+                }
+            }
+            if (mat_ && f_ >= 1700 && f_ < 1801 && f_ != last && ex->pass_w == 1280 && a_ && vk_mem_inspect(a_ + 0x8c, 4, &mi) && mi.pool_kind == VK_MEM_INSPECT_POOL_IMPORT) {
+                last = f_;
+                const float *v_ = (const float *)(uintptr_t)(a_ + 0x80);
+                rt_log("vk: f %llu slot2 %#llx +0x80: %g %g %g %g", (unsigned long long)f_, (unsigned long long)a_, v_[0], v_[1], v_[2], v_[3]);
+            }
         }
     }
     s.vs = vs, s.fs = fs, s.gs = gs, s.ts = ts;
