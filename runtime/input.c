@@ -226,7 +226,7 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
 static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off; live (cfg_version)
 static unsigned mouse_sens_seen;
 
-static float mouse_sens_get(void) {
+float input_mouse_sensitivity(void) {
     unsigned ver = cfg_version();
     if (mouse_sens >= 0 && ver == mouse_sens_seen) return mouse_sens;
     mouse_sens_seen = ver;
@@ -236,37 +236,9 @@ static float mouse_sens_get(void) {
 }
 
 
-// Ocarina: the mouse turns the camera itself. ov_camera_mouse is called every frame by the camera update (patched in by
-// tools/oot/patch_generated.py) with the camera node, and adds the raw mouse motion to the camera's own angles, in
-// degrees: yaw at node+0x1a4 and pitch at node+0x18c, the two angles the game integrates from the right stick, so the
-// stick and the mouse add up and the game's own speed limit on the stick does not apply to the mouse. Once the hook has
-// run, the mouse no longer goes through the simulated right stick.
-#define CAM_YAW_OFF 0x1a4
-#define CAM_PITCH_OFF 0x18c
-#define CAM_PITCH_MIN (-85.f)   // the limits the game keeps the pitch in (looking up / down)
-#define CAM_PITCH_MAX 89.f
-#define CAM_DEG_PER_COUNT 0.06f
-static volatile int cam_mouse_hooked;
-
-void ov_camera_mouse(uint64_t node) {
-    cam_mouse_hooked = 1;
-    int32_t dx, dy;
-    ikb_mouse_take(&dx, &dy);
-    float sens = mouse_sens_get();
-    if (!ikb_captured() || sens <= 0 || (!dx && !dy) || !node) return;
-    float *yaw = (float *)(uintptr_t)(node + CAM_YAW_OFF), *pitch = (float *)(uintptr_t)(node + CAM_PITCH_OFF);
-    float y = *yaw - (float)dx * sens * CAM_DEG_PER_COUNT;   // right turns the view right: the scene moves left
-    float p = *pitch + (float)dy * sens * CAM_DEG_PER_COUNT;
-    y = fmodf(y, 360.f);
-    if (y > 180.f) y -= 360.f;
-    if (y < -180.f) y += 360.f;
-    *yaw = y;
-    *pitch = p < CAM_PITCH_MIN ? CAM_PITCH_MIN : p > CAM_PITCH_MAX ? CAM_PITCH_MAX : p;
-}
-
 // The mouse camera as a right-stick sample, held for the whole presented frame. Under `lock`.
 static void mouse_camera(int32_t out[2]) {
-    if (cam_mouse_hooked) { out[0] = out[1] = 0; return; }   // the camera update takes the mouse itself
+    if (input_camera_mouse_active()) { out[0] = out[1] = 0; return; }
     static uint64_t frame = ~0ull, t0;
     static int32_t held[2];
     uint64_t now = plat_now_ns();
@@ -281,7 +253,7 @@ static void mouse_camera(int32_t out[2]) {
         if (fr != frame) {
             double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
             ikb_mouse_take(&dx, &dy);
-            input_mouse_stick(dx, dy, dt, mouse_sens_get(), held);
+            input_mouse_stick(dx, dy, dt, input_mouse_sensitivity(), held);
             frame = fr;
             t0 = now;
         } else if (age > 0.1) {
@@ -518,7 +490,7 @@ static volatile int32_t g_menu;   // the in-game menu, the same way (input_menu)
 
 int input_cursor_allowed(void) {
     const char *in = cfg_get("TOTK_INPUT");
-    return g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none"));
+    return g_block != 1 && g_menu != 1 && input_mouse_sensitivity() > 0 && !(in && !strcmp(in, "none"));
 }
 
 void input_block(int on) {
