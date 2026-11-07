@@ -118,7 +118,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x202: case 0x802: case 0x803: case 0x424: case 0x724: case 0x824: case 0xe24: case 0x227:
         case 0x810: case 0x819: case 0x845: case 0x906: case 0x820:
         case 0x812: case 0x589:
-        case 0x212: case 0x207: case 0x807: case 0x208: case 0x808:
+        case 0x212: case 0x207: case 0x807: case 0x208: case 0x808: case 0xc08:
         case 0x220: case 0xa20: case 0x221: case 0x421: case 0x621:
         case 0x223: case 0x423: case 0x623: case 0x823: case 0xa23:
         case 0x243: case 0x245: case 0x306:
@@ -2551,13 +2551,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     (second_dest != 255 && second_dest + 1 >= register_limit))
                     return fail(index, "native per-tap gather operands");
                 std::array<std::optional<u32>, 2> packed_offsets;
+                // Proves the packed offsets immediates (the host gather takes constants). When it cannot,
+                // the offsets are read from Rb, Rb+1 at run time and the translator splits the gather into
+                // one gather per tap (TexturePass.InsertConstOffsets; the host answers that it has no
+                // non-constant offsets), so the program still lowers.
+                const char* const unproven = [&]() -> const char* {
                 bool imad_offsets = false;
                 bool predicate_clobbered = false;
                 if (!bounded_control)
-                    return fail(index, "native per-tap gather control-flow proof");
+                    return "native per-tap gather control-flow proof";
                 for (u32 cursor = index; cursor > 0 && (!packed_offsets[0] || !packed_offsets[1]);) {
                     if (control_entries[cursor])
-                        return fail(index, "native per-tap gather control-flow proof");
+                        return "native per-tap gather control-flow proof";
                     const auto& definition = code[--cursor];
                     if (definition.Bits(12, 4) == 15) continue;
                     const u32 op = definition.Bits(0, 12), target = definition.Bits(16, 8);
@@ -2588,7 +2593,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                             const u32 reg = source_b + i;
                             if ((target != 255 && reg >= target && reg < target + first_count) ||
                                 (high != 255 && reg >= high && reg < high + second_count))
-                                return fail(index, "native per-tap gather offset clobber");
+                                return "native per-tap gather offset clobber";
                         }
                         continue;
                     }
@@ -2605,7 +2610,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         count = 0;
                         break;
                     }
-                    if (!count) return fail(index, "native per-tap gather offset proof");
+                    if (!count) return "native per-tap gather offset proof";
                     for (u32 i = 0; i < 2; ++i) {
                         if (packed_offsets[i] || target == 255 || source_b + i < target || source_b + i >= target + *count)
                             continue;
@@ -2615,7 +2620,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                                                 !predicate_clobbered;
                         if ((!move && !imad) || (definition.Bits(12, 4) != 7 && !same_guard) ||
                             (definition.words[3] & 0xc00001ffU))
-                            return fail(index, "native per-tap gather nonconstant offsets");
+                            return "native per-tap gather nonconstant offsets";
                         imad_offsets |= imad;
                         packed_offsets[i] = definition.words[1];
                     }
@@ -2632,21 +2637,27 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         if (op != 0x326 && op != 0x802 && op != 0x307 && op != 0x421 &&
                             op != 0xa20 && op != 0xb63 && op != 0x221 && op != 0x823 &&
                             op != 0x423 && op != 0x223 && op != 0x308 && op != 0x220 && op != 0x820)
-                            return fail(index, "native per-tap gather control-flow proof");
+                            return "native per-tap gather control-flow proof";
                     }
-                    if (!terminal) return fail(index, "native per-tap gather terminal proof");
+                    if (!terminal) return "native per-tap gather terminal proof";
                 }
                 for (const auto& packed : packed_offsets) {
-                    if (!packed) return fail(index, "native per-tap gather missing offsets");
+                    if (!packed) return "native per-tap gather missing offsets";
                     // Each byte is a signed 6-bit offset; the gather reads only the low six bits.
                     for (u32 shift = 0; shift < 32; shift += 8) {
                         const u32 value = (*packed >> shift) & 255;
                         if (value > 31 && value < 224)
-                            return fail(index, "native per-tap gather offset range");
+                            return "native per-tap gather offset range";
                     }
                 }
-                for (u32 i = 0; i < packed_offsets.size(); ++i)
-                    emit(0x010000000007f000ULL | (248 + i) | (u64{*packed_offsets[i]} << 20));
+                return nullptr;
+                }();
+                for (u32 i = 0; i < packed_offsets.size(); ++i) {
+                    if (unproven)
+                        emit(0x5c98000000000000ULL | predicate | (248 + i) | (u64{15} << 39) | (u64{source_b + i} << 20));
+                    else
+                        emit(0x010000000007f000ULL | (248 + i) | (u64{*packed_offsets[i]} << 20));
+                }
             }
             if (!bindless) result.required_texture_buffer = binding;
             // Two coordinates: x in Ra, y in Rb (the coordinate list splits evenly across them);
@@ -3259,7 +3270,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x207: case 0x807: case 0xa07: case 0xc07:
-        case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
+        case 0x208: case 0x808: case 0xa08: case 0xc08: { // Bitwise SEL / FSEL
             // FSEL applies the floating operand modifiers (negate/absolute) before selecting.
             const bool floating = (opcode & 0x1ff) == 0x008;
             const u32 a = operand(0, floating), b = operand(1, floating);
@@ -3796,12 +3807,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (copies_link(code[prior])) linked = true;
                 else if (code[prior].Bits(16, 8) == return_reg) break;
             }
-            if (!main_exited || !linked ||
+            const u64 raw = insn.words[1] | (u64{insn.words[2] & 0x3ffff} << 32);
+            const s64 relative = static_cast<s64>(raw << 14) >> 14;
+            // The last instruction of a program is its epilogue: it needs no call link (there is no caller to return to).
+            const bool final_ret = static_cast<size_t>(index) + 1 == code.size() && s64{index} * 16 + 16 + relative == 0;
+            if (!main_exited || (!linked && !final_ret) ||
                 (insn.words[0] & 0x00ffffffU) != 0x00007950 || return_reg >= 249 ||
                 (insn.words[2] & ~0x3ffffU) != 0x03c00000 || !barrier_tokens.empty())
                 return fail(index, "native return linkage mode");
-            const u64 raw = insn.words[1] | (u64{insn.words[2] & 0x3ffff} << 32);
-            const s64 relative = static_cast<s64>(raw << 14) >> 14;
             if (s64{index} * 16 + 16 + relative != 0)
                 return fail(index, "native return relative base");
             emit(0xe32000000007000fULL);

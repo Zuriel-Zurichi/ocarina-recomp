@@ -321,14 +321,25 @@ static int create_device(void) {
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
 
-    VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceVulkan13Properties p13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+                                                           .pNext = &p13};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
     g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
+    // maxBufferSize: an imported pool larger than this gets window buffers (vk_memory.c import_pool). AMD reports 2 GiB
+    // and one of Ocarina's pools is 2.4 GiB; NVIDIA reports far more, so nothing changes there.
+    g_vk.max_buffer_size = p13.maxBufferSize;
     vk_caps_init(&g_vk);
 
+    // VMA keeps one empty block of each memory type (256 MiB by default): five types held ~1.3 GiB of the 8 GiB card
+    // doing nothing. A smaller preferred block cuts that reserve. TOTK_VMA_BLOCK_MIB overrides it.
+    const char *bm = cfg_get("TOTK_VMA_BLOCK_MIB");
+    VkDeviceSize block = bm && *bm ? (VkDeviceSize)atoi(bm) << 20 : 64ull << 20;
+    if (block < 16ull << 20) block = 16ull << 20;
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,
                                  .vulkanApiVersion = VK_API_VERSION_1_3,
+                                 .preferredLargeHeapBlockSize = block,
                                  .flags = (g_vk.has_buffer_device_address ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT : 0) |
                                           (g_vk.has_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0),
                                  .pDeviceMemoryCallbacks = vk_headroom_callbacks()};

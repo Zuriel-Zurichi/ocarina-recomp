@@ -47,7 +47,7 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 #define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
-#define ONESHOT_WAIT_MS 1000u   /* LOCAL TEST (Ocarina): was 30000; a pipeline with guarded candidates compiles for a minute, and the game froze that long */ //   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
+#define ONESHOT_WAIT_MS 1000u   // Per one-shot draw, shared across the frame on AMD.
 
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
@@ -621,6 +621,9 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             if (four && (want == VK_FORMAT_R32_SFLOAT || want == VK_FORMAT_R8G8B8A8_UNORM)) view_format = want;
         }
     }
+    int reformat = 0;   // a sampled RGB9E5 view of an R11G11B10F image (vk_texture.c slot_resolve)
+    if (!storage && hv && v->set_format && v->format == 0x40 && img->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+        view_format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, reformat = 1;
     ViewKey k = {img->image, view_format, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -631,7 +634,8 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                       .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
+    if (img->block_views || reformat) ci.pNext = &use;   // block views: the image's COLOR_ATTACHMENT usage is theirs
+                                                           // (vk_texture.c); RGB9E5 has no storage or attachment feature
     else if (!storage && vk_srgb_store_format(view_format) != view_format && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT))
         use.usage = img->usage & ~VK_IMAGE_USAGE_STORAGE_BIT, ci.pNext = &use;   // sRGB views have no storage feature
     VkImageView view;
@@ -1025,11 +1029,13 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // 0x610, the base instance at 0x644. Other stages: zeros. Unbound slots read zero, since the replay keeps them zero.
 // Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
 // LOCAL TEST (Ocarina): buffers a compute shader may reach through pointers stored in memory, which the translator cannot
-// see: it tests the addresses listed in c0 + 0x800, 16 bytes each (address, size). Collected per dispatch from the bound
+// see: it tests the addresses listed in c0 + 0x900, 16 bytes each (address, size). Collected per dispatch from the bound
 // uniform and storage buffers, following stored pointers two levels down. ponytail: only stored pointers near the start of
 // a buffer are followed and each binding stops at 32 MiB; a real fix would give shaders the guest address space.
-#define DYN_C0 0x800
+#define DYN_C0 NVN2_C0_LIST
 #define DYN_N 32
+_Static_assert(0x770 + 16 * 16 <= DYN_C0, "native mesh table overlaps candidates");
+_Static_assert(DYN_C0 + DYN_N * 16 <= VK_C0_BYTES, "candidate list exceeds bank");
 static struct { uint64_t addr, size; } dyn_lists[6][DYN_N];   // per NVN stage
 static int nvn_stage_of(int gfx_stage);
 
@@ -1156,7 +1162,7 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     if (stage == NVN_STAGE_CS && c0_lay) {
-        if (!nvn2_c0_pack(bank, VK_C0_BYTES, c0_lay, c0_push, ssbo, ubo))
+        if (!nvn2_c0_pack(bank, DYN_C0, c0_lay, c0_push, ssbo, ubo))
             rt_fatal("vk: invalid NVN 2 compute parameter-block layout");
         memcpy(bank, dispatch, 12);   // LOCAL TEST (Ocarina): the first words of the bank are the dispatch size (the sky ambient divides by them)
         memcpy(bank + DYN_C0, dyn_lists[stage], sizeof dyn_lists[stage]);
@@ -1168,7 +1174,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
     if (base < 0) return;
     c0_table(bank + base, ssbo);
     if (stage == NVN_STAGE_VS || stage == 4) c0_table(bank + 0x770, ssbo);   // LOCAL TEST (Ocarina): the mesh stage's table (seedds/nxnative 5ae0d9aea)
-    // after the table: its slots 9+ lie on the list, and the guarded candidates there (translator patch 0025) must see the list. ponytail: a mesh shader using slot 9+ directly loses it
+    // The synthetic list follows every native table, including all 16 mesh storage slots.
     if (stage >= 0 && stage < 6 && dyn_lists[stage][0].addr) memcpy(bank + DYN_C0, dyn_lists[stage], sizeof dyn_lists[stage]);
     if (stage == 3) return;   // a task stage: its table is at c0+0x670; nothing else of this bank is used
     if (stage == NVN_STAGE_CS) {
@@ -1294,7 +1300,7 @@ static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     // bindings; it does not synthesize that driver bank or establish the native NVN2 geometry ABI.
     int off = r->handle * 4, base = st == 3 ? 0x670 : st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 :
                                   st == NVN_STAGE_GS ? 0x410 : st == NVN_STAGE_CS || st == 4 ? 0x310 : -1;
-    if ((st == NVN_STAGE_VS || st == 4) && off >= 0x770 && off < DYN_C0 && (off - 0x770) % 16 == 0) return (off - 0x770) / 16;   // LOCAL TEST (Ocarina)
+    if ((st == NVN_STAGE_VS || st == 4) && off >= 0x770 && off < 0x870 && (off - 0x770) % 16 == 0) return (off - 0x770) / 16;   // LOCAL TEST (Ocarina)
     if (st == NVN_STAGE_CS && off >= 0x210 && off < 0x310 && (off - 0x210) % 16 == 0) {
         *ubo = 1;
         return (off - 0x210) / 16;
@@ -2937,12 +2943,26 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
             }
         }
     }
+    // Before the vertex slot is read: a shader still translating there can turn out to be a task shader (PR #29, qiyuey);
+    // built as a vertex stage it crashed NVIDIA's compiler (nvgpucomp64.dll) at the Deku Tree scene start.
+    // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
+    // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
+    // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
+    int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
+    if (vs_wait || fs_wait || gs_wait) {
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
+        perf_count(PERF_CNT_ONESHOT_WAIT);
+        if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
+        if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+        native_gs_vs = vs, native_gs_fs = fs;
+        if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
+    }
     const GfxShader *ts = NULL;
     if (vs && gfx_shader_is_task(vs)) {   // LOCAL TEST (Ocarina): task in the vertex slot, mesh in the tessellation slot
         int has_mesh = 0;
         ts = vs;
         vs = shader_for(ex, 4, &has_mesh, NULL, 1);
-        if (!vs) return draw_why(ex, "task without a mesh stage"), 0;
+        if (!vs || !gfx_shader_is_mesh(vs)) return draw_why(ex, "task without a mesh stage"), 0;
         mesh_task_draw = 1;
         B.c0_valid[0] = 0;
     }
@@ -2976,18 +2996,6 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
                        (unsigned long long)nvn2_origin(vcode), k[1], (unsigned long long)nvn2_origin(fcode));
             }
         }
-    }
-    // A draw into a target the previous frame did not render (or into none) waits for a pending shader or pipeline:
-    // one-shot draws (volumes and LUTs generated once, later only sampled) would leave their target empty for the
-    // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
-    int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
-    if (vs_wait || fs_wait || gs_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
-        perf_count(PERF_CNT_ONESHOT_WAIT);
-        if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
-        if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
-        native_gs_vs = vs, native_gs_fs = fs;
-        if (gs_wait) gs = shader_for(ex, NVN_STAGE_GS, &has_gs, NULL, 1);
     }
     if (stage_diag_skip(ex, vs)) { if (draw_is_mesh) draw_why(ex, "stage diag skip"); return 0; }
     if (light_quad_fault_skip(ex, vs, fs)) return draw_why(ex, "light quad skip"), 0;
@@ -3042,20 +3050,26 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     int pending;
     // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) waits for
     // its pipeline: skipping it can leave a black tile. The waits share 50 ms per presented frame
-    // (TOTK_PIPE_SKIP=fullscreen skips them instead). A one-shot draw waits without that budget. Everything else is
+    // (TOTK_PIPE_SKIP=fullscreen skips them instead). On AMD one-shot draws share a separate budget. Everything else is
     // skipped while its pipeline is built.
-    static uint64_t wait_frame;
+    static uint64_t wait_frame = UINT64_MAX;
     static uint64_t wait_left_ns;
-    uint32_t wait_ms = 0;
-    uint64_t t0 = 0;
-    if (oneshot > 0) {
-        wait_ms = ONESHOT_WAIT_MS;
-    } else if (skip < 2 && count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
-        uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        if (f != wait_frame) wait_frame = f, wait_left_ns = 50000000;
-        wait_ms = (uint32_t)(wait_left_ns / 1000000);
-        if (wait_ms) t0 = kern_now_ns();
+    static uint64_t oneshot_left_ns;
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    if (frame != wait_frame) {
+        wait_frame = frame;
+        wait_left_ns = 50000000;
+        oneshot_left_ns = ONESHOT_WAIT_MS * 1000000ull;
     }
+    uint64_t *budget_ns = NULL;
+    uint32_t wait_ms = 0;
+    if (oneshot > 0) {
+        if (vk_caps.amd) budget_ns = &oneshot_left_ns;
+        else wait_ms = ONESHOT_WAIT_MS;
+    } else if (skip < 2 && count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
+        budget_ns = &wait_left_ns;
+    }
+    if (budget_ns) wait_ms = (uint32_t)(*budget_ns / 1000000);
     // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
     // from the info the cache entry keeps.
@@ -3066,18 +3080,24 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         info = PM.info, pending = 0;
         p = __atomic_load_n(&info->pipeline, __ATOMIC_ACQUIRE);
     } else {
-        w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
+        w0 = wait_ms ? kern_now_ns() : 0;
         p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
-        if (t0) {
-            uint64_t spent = kern_now_ns() - t0;
-            wait_left_ns = spent < wait_left_ns ? wait_left_ns - spent : 0;
+        if (w0 && budget_ns) {
+            uint64_t spent = kern_now_ns() - w0;
+            *budget_ns = spent < *budget_ns ? *budget_ns - spent : 0;
         }
         why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
-        if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
+        uint32_t oneshot_wait_ms = vk_caps.amd ? (uint32_t)(oneshot_left_ns / 1000000) : ONESHOT_WAIT_MS;
+        if (pending && oneshot < 0 && oneshot_wait_ms && !vk_exec_targets_recent(ex, skip >= 1)) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";
-            if (!w0) w0 = kern_now_ns();
-            p = vk_pipeline_graphics_async(&s, &info, &pending, ONESHOT_WAIT_MS);
+            uint64_t start = kern_now_ns();
+            if (!w0) w0 = start;
+            p = vk_pipeline_graphics_async(&s, &info, &pending, oneshot_wait_ms);
+            if (vk_caps.amd) {
+                uint64_t spent = kern_now_ns() - start;
+                oneshot_left_ns = spent < oneshot_left_ns ? oneshot_left_ns - spent : 0;
+            }
         }
         PM.valid = !pending && p && info;
         if (PM.valid) PM.s = s, PM.info = info;
@@ -3663,10 +3683,25 @@ static int big_compute_blit(VkExec *ex, const GfxShader *cs) {
                                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         // ponytail: an image of an earlier size is left allocated; the scene size rarely changes
-        if (vmaCreateImage(vk_ctx()->vma, &ci, &ai, &e5, &e5_mem, NULL) != VK_SUCCESS) rt_fatal("vk: RGB9E5 image");
+        // Without the image the dispatch is skipped for this frame, not the game: on an RX Vega 11 (integrated, 1.8 GiB)
+        // with the system's commit nearly used up the create failed and rt_fatal closed the game. Tried again next frame.
+        VkResult er = vmaCreateImage(vk_ctx()->vma, &ci, &ai, &e5, &e5_mem, NULL);
+        if (er != VK_SUCCESS) {
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 4)
+                rt_log("vk: RGB9E5 image %ux%u not created (%d): the upscale pass is skipped this frame", src->width,
+                       src->height, (int)er);
+            e5 = VK_NULL_HANDLE, e5_mem = NULL, e5_w = e5_h = 0;
+            return 1;
+        }
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e5, .viewType = VK_IMAGE_VIEW_TYPE_2D,
                                     .format = VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        if (vkCreateImageView(vk_ctx()->device, &vi, NULL, &e5_view) != VK_SUCCESS) rt_fatal("vk: RGB9E5 view");
+        if (vkCreateImageView(vk_ctx()->device, &vi, NULL, &e5_view) != VK_SUCCESS) {
+            rt_log("vk: RGB9E5 view not created: the upscale pass is skipped this frame");
+            vmaDestroyImage(vk_ctx()->vma, e5, e5_mem);
+            e5 = VK_NULL_HANDLE, e5_mem = NULL, e5_w = e5_h = 0;
+            return 1;
+        }
         e5_w = src->width, e5_h = src->height, fresh = 1;
     }
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
